@@ -1,82 +1,69 @@
 <?php
 header("Content-Type: application/json; charset=utf-8");
 
-// ===== Helper =====
-function json_error($msg) {
-    echo json_encode(["error" => $msg], JSON_UNESCAPED_UNICODE);
+function json_error($msg){
+    echo json_encode(["error"=>$msg], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-// ===== Input =====
 if (!isset($_GET['song']) || trim($_GET['song']) === '') {
     json_error("missing_song");
 }
 
 $song   = trim($_GET['song']);
 $artist = isset($_GET['artist']) ? trim($_GET['artist']) : '';
+$keyword = $song . ' ' . $artist;
 
-// Ghép keyword: tên bài + tên ca sĩ (nếu có)
-$keyword = $song;
-if ($artist !== '') {
-    $keyword .= ' ' . $artist;
-}
-
-// client_id SoundCloud của bạn
+// SoundCloud Client ID
 $client_id = "xwYTVSni6n4FghaI0c4uJ8T9c4pyJ3rh";
 
-// Chuẩn hóa cho URL
-$keyword_q = urlencode($keyword);
+function get_url($url){
+    $h = curl_init();
+    curl_setopt($h, CURLOPT_URL, $url);
+    curl_setopt($h, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($h, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($h, CURLOPT_SSL_VERIFYPEER, false);
+    curl_setopt($h, CURLOPT_USERAGENT, "Mozilla/5.0");
+    $out = curl_exec($h);
+    curl_close($h);
+    return $out;
+}
 
-// ===== 1) Thử SoundCloud trước =====
-$search_url = "https://api-v2.soundcloud.com/search/tracks?q={$keyword_q}&client_id={$client_id}&limit=1";
+/* ---------- 1) TRY SOUNDCLOUD FIRST ---------- */
+$search_url = "https://api-v2.soundcloud.com/search/tracks?q=" . urlencode($keyword) . "&client_id=$client_id&limit=1";
 
-$search_json = @file_get_contents($search_url);
-if ($search_json !== false) {
-    $search = json_decode($search_json, true);
+$sc_json = get_url($search_url);
+if ($sc_json !== false){
+    $sc = json_decode($sc_json, true);
 
-    if (isset($search["collection"][0])) {
-        $track = $search["collection"][0];
-        $track_id = $track["id"];
-        $title_sc = $track["title"];
-        $artist_sc = $track["user"]["username"];
+    if (isset($sc["collection"][0])) {
+        $track = $sc["collection"][0];
+        $track_id = $track['id'];
 
-        // Lấy media để tìm transcodings
-        $info_url = "https://api-v2.soundcloud.com/tracks/{$track_id}?client_id={$client_id}";
-        $info_json = @file_get_contents($info_url);
+        $info_url = "https://api-v2.soundcloud.com/tracks/$track_id?client_id=$client_id";
+        $info_json = get_url($info_url);
 
         if ($info_json !== false) {
             $info = json_decode($info_json, true);
 
-            if (isset($info["media"]["transcodings"])) {
-                $mp3_progressive = "";
-                foreach ($info["media"]["transcodings"] as $t) {
-                    if (
-                        isset($t["format"]["protocol"]) &&
-                        $t["format"]["protocol"] === "progressive"
-                    ) {
-                        $mp3_progressive = $t["url"];
-                        break;
-                    }
-                }
+            if (isset($info['media']['transcodings'])) {
+                foreach ($info['media']['transcodings'] as $t) {
+                    if ($t['format']['protocol'] === 'progressive') {
+                        $trans_url = $t['url'] . "?client_id=$client_id";
+                        $trans_json = get_url($trans_url);
 
-                if ($mp3_progressive !== "") {
-                    // Gọi transcoding để lấy link cf-media.sndcdn.com
-                    $trans_url = $mp3_progressive . "?client_id={$client_id}";
-                    $trans_json = @file_get_contents($trans_url);
-
-                    if ($trans_json !== false) {
-                        $trans = json_decode($trans_json, true);
-                        if (isset($trans["url"])) {
-                            $final_mp3 = $trans["url"]; // link mp3 real (cf-media.sndcdn.com)
-
-                            echo json_encode([
-                                "title"      => $title_sc,
-                                "artist"     => $artist_sc,
-                                "audio_url"  => $final_mp3,
-                                "lyric_url"  => "",
-                                "language"   => "vietnamese"
-                            ], JSON_UNESCAPED_UNICODE);
-                            exit;
+                        if ($trans_json !== false) {
+                            $trans = json_decode($trans_json, true);
+                            if (isset($trans['url'])) {
+                                echo json_encode([
+                                    "title"=>$track["title"],
+                                    "artist"=>$track["user"]["username"],
+                                    "audio_url"=>$trans["url"],
+                                    "lyric_url"=>"",
+                                    "language"=>"vietnamese"
+                                ], JSON_UNESCAPED_UNICODE);
+                                exit;
+                            }
                         }
                     }
                 }
@@ -85,34 +72,23 @@ if ($search_json !== false) {
     }
 }
 
-// ===== 2) Fallback sang YouTube (dùng HTML + ytdlp worker) =====
-// Tìm trên YouTube bằng HTML, không cần API key
-$yt_query = urlencode($keyword . " audio");
-$yt_search_url = "https://www.youtube.com/results?search_query={$yt_query}";
+/* ---------- 2) YOUTUBE FALLBACK ---------- */
 
-$yt_html = @file_get_contents($yt_search_url);
-if ($yt_html === false) {
-    json_error("youtube_failed");
+$yt_html = get_url("https://www.youtube.com/results?search_query=".urlencode($keyword));
+if (!$yt_html) json_error("youtube_failed");
+
+if (!preg_match('/\/watch\?v=([a-zA-Z0-9_-]{11})/', $yt_html, $m)){
+    json_error("not_found");
 }
 
-// Rất đơn giản: bắt videoId đầu tiên dạng "watch?v=XXXXXXXXXXX"
-if (preg_match('/\/watch\?v=([a-zA-Z0-9_-]{11})/', $yt_html, $m)) {
-    $video_id = $m[1];
+$video_id = $m[1];
+$mp3_url = "https://api.ytdlp.workers.dev/mp3?id=".$video_id;
 
-    // Dùng worker ytdlp để convert sang mp3
-    // Có thể dùng các endpoint kiểu: https://api.ytdlp.workers.dev/mp3?id=VIDEO_ID
-    // (Nếu sau này worker này chết, bạn chỉ cần đổi domain, format giữ nguyên)
-    $audio_url = "https://api.ytdlp.workers.dev/mp3?id=" . $video_id;
-
-    echo json_encode([
-        "title"      => $song,
-        "artist"     => ($artist !== '' ? $artist : "YouTube"),
-        "audio_url"  => $audio_url,
-        "lyric_url"  => "",
-        "language"   => "vietnamese"
-    ], JSON_UNESCAPED_UNICODE);
-    exit;
-}
-
-// Không tìm thấy ở đâu
-json_error("not_found_anywhere");
+echo json_encode([
+    "title" => $song,
+    "artist" => ($artist ?: "YouTube"),
+    "audio_url" => $mp3_url,
+    "lyric_url" => "",
+    "language" => "vietnamese"
+], JSON_UNESCAPED_UNICODE);
+?>
