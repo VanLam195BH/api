@@ -1,94 +1,74 @@
 <?php
-header("Content-Type: application/json; charset=utf-8");
+header("Content-Type: application/json");
 
-function json_error($msg){
-    echo json_encode(["error"=>$msg], JSON_UNESCAPED_UNICODE);
+if (!isset($_GET['song']) || trim($_GET['song']) == "") {
+    echo json_encode(["error" => "missing_song"]);
     exit;
 }
 
-if (!isset($_GET['song']) || trim($_GET['song']) === '') {
-    json_error("missing_song");
-}
+$song = urlencode($_GET['song']);
 
-$song   = trim($_GET['song']);
-$artist = isset($_GET['artist']) ? trim($_GET['artist']) : '';
-$keyword = $song . ' ' . $artist;
+// ===== 1) TÌM TRÊN PIPED =====
+$search_url = "https://piped.video/api/v1/search?q=$song";
+$search_json = @file_get_contents($search_url);
+if ($search_json) {
+    $search = json_decode($search_json, true);
+    if (isset($search[0]["url"])) {
+        // Lấy ID video
+        $video_url = $search[0]["url"];  // "/watch?v=xxxx"
+        parse_str(parse_url($video_url, PHP_URL_QUERY), $q);
+        $video_id = $q["v"];
 
-// SoundCloud Client ID
-$client_id = "xwYTVSni6n4FghaI0c4uJ8T9c4pyJ3rh";
+        // Lấy stream
+        $stream_url = "https://piped.video/api/v1/streams/$video_id";
+        $stream_json = @file_get_contents($stream_url);
+        if ($stream_json) {
+            $stream = json_decode($stream_json, true);
 
-function get_url($url){
-    $h = curl_init();
-    curl_setopt($h, CURLOPT_URL, $url);
-    curl_setopt($h, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($h, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($h, CURLOPT_SSL_VERIFYPEER, false);
-    curl_setopt($h, CURLOPT_USERAGENT, "Mozilla/5.0");
-    $out = curl_exec($h);
-    curl_close($h);
-    return $out;
-}
-
-/* ---------- 1) TRY SOUNDCLOUD FIRST ---------- */
-$search_url = "https://api-v2.soundcloud.com/search/tracks?q=" . urlencode($keyword) . "&client_id=$client_id&limit=1";
-
-$sc_json = get_url($search_url);
-if ($sc_json !== false){
-    $sc = json_decode($sc_json, true);
-
-    if (isset($sc["collection"][0])) {
-        $track = $sc["collection"][0];
-        $track_id = $track['id'];
-
-        $info_url = "https://api-v2.soundcloud.com/tracks/$track_id?client_id=$client_id";
-        $info_json = get_url($info_url);
-
-        if ($info_json !== false) {
-            $info = json_decode($info_json, true);
-
-            if (isset($info['media']['transcodings'])) {
-                foreach ($info['media']['transcodings'] as $t) {
-                    if ($t['format']['protocol'] === 'progressive') {
-                        $trans_url = $t['url'] . "?client_id=$client_id";
-                        $trans_json = get_url($trans_url);
-
-                        if ($trans_json !== false) {
-                            $trans = json_decode($trans_json, true);
-                            if (isset($trans['url'])) {
-                                echo json_encode([
-                                    "title"=>$track["title"],
-                                    "artist"=>$track["user"]["username"],
-                                    "audio_url"=>$trans["url"],
-                                    "lyric_url"=>"",
-                                    "language"=>"vietnamese"
-                                ], JSON_UNESCAPED_UNICODE);
-                                exit;
-                            }
-                        }
-                    }
-                }
+            if (isset($stream["audioStreams"][0]["url"])) {
+                echo json_encode([
+                    "title" => $search[0]["title"],
+                    "artist" => "YouTube",
+                    "audio_url" => $stream["audioStreams"][0]["url"],
+                    "language" => "vietnamese"
+                ]);
+                exit;
             }
         }
     }
 }
 
-/* ---------- 2) YOUTUBE FALLBACK ---------- */
+// ===== 2) FALLBACK SOUNDCLOUD =====
 
-$yt_html = get_url("https://www.youtube.com/results?search_query=".urlencode($keyword));
-if (!$yt_html) json_error("youtube_failed");
+$client_id = "xwYTVSni6n4FghaI0c4uJ8T9c4pyJ3rh";
+$search_sc = "https://api-v2.soundcloud.com/search/tracks?q=$song&client_id=$client_id&limit=1";
 
-if (!preg_match('/\/watch\?v=([a-zA-Z0-9_-]{11})/', $yt_html, $m)){
-    json_error("not_found");
+$sc_json = @file_get_contents($search_sc);
+$sc_data = json_decode($sc_json, true);
+
+if (isset($sc_data["collection"][0])) {
+    $track = $sc_data["collection"][0];
+    $title = $track["title"];
+    $artist = $track["user"]["username"];
+    $track_id = $track["id"];
+
+    $info_url = "https://api-v2.soundcloud.com/tracks/$track_id?client_id=$client_id";
+    $info_json = @file_get_contents($info_url);
+    $info = json_decode($info_json, true);
+
+    foreach ($info["media"]["transcodings"] as $t) {
+        if ($t["format"]["protocol"] == "progressive") {
+            $trans = json_decode(file_get_contents($t["url"] . "?client_id=$client_id"), true);
+
+            echo json_encode([
+                "title" => $title,
+                "artist" => $artist,
+                "audio_url" => $trans["url"],
+                "language" => "vietnamese"
+            ]);
+            exit;
+        }
+    }
 }
 
-$video_id = $m[1];
-$mp3_url = "https://api.ytdlp.workers.dev/mp3?id=".$video_id;
-
-echo json_encode([
-    "title" => $song,
-    "artist" => ($artist ?: "YouTube"),
-    "audio_url" => $mp3_url,
-    "lyric_url" => "",
-    "language" => "vietnamese"
-], JSON_UNESCAPED_UNICODE);
-?>
+echo json_encode(["error" => "not_found"]);
